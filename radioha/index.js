@@ -11,6 +11,229 @@ const instance = axios.create({
     timeout: 3000,
 });
 
+
+// ============================================================
+// HLS + Sonos artwork support
+// KBS Classic 전용 테스트
+// ============================================================
+
+const os = require('os');
+const path = require('path');
+
+const HLS_DIR = path.join(os.tmpdir(), 'radioha_hls');
+const HLS_SEGMENT_TIME = 6;
+const HLS_PLAYLIST_SIZE = 5;
+
+const SONOS_ARTWORK_URL =
+    'http://192.168.0.32:8123/local/images/logos/kclassic.png';
+
+if (!fs.existsSync(HLS_DIR)) {
+    fs.mkdirSync(HLS_DIR, { recursive: true });
+}
+
+let hlsProcess = null;
+let hlsSequence = 0;
+let hlsStarted = false;
+
+
+// ID3v2 sync-safe integer
+function id3SyncSafe(size) {
+    return Buffer.from([
+        (size >> 21) & 0x7f,
+        (size >> 14) & 0x7f,
+        (size >> 7) & 0x7f,
+        size & 0x7f
+    ]);
+}
+
+
+// ID3v2.3 frame
+function id3Frame(id, body) {
+    const header = Buffer.alloc(10);
+
+    header.write(id, 0, 4, 'ascii');
+    header.writeUInt32BE(body.length, 4);
+    header.writeUInt16BE(0, 8);
+
+    return Buffer.concat([header, body]);
+}
+
+
+// ID3v2.3 WXXX
+function makeWxxxFrame() {
+    const description = Buffer.from('artworkURL_640x', 'latin1');
+    const imageUrl = Buffer.from(SONOS_ARTWORK_URL, 'latin1');
+
+    const body = Buffer.concat([
+        Buffer.from([0x00]),
+        description,
+        Buffer.from([0x00]),
+        imageUrl
+    ]);
+
+    return id3Frame('WXXX', body);
+}
+
+
+// HLS packed-audio timestamp PRIV frame
+function makeTimestampPrivFrame(timestamp90k) {
+    const owner = Buffer.from(
+        'com.apple.streaming.transportStreamTimestamp',
+        'latin1'
+    );
+
+    const timestamp = Buffer.alloc(8);
+
+    timestamp.writeBigUInt64BE(
+        BigInt(timestamp90k),
+        0
+    );
+
+    const body = Buffer.concat([
+        owner,
+        Buffer.from([0x00]),
+        timestamp
+    ]);
+
+    return id3Frame('PRIV', body);
+}
+
+
+// ID3v2.3 tag
+function makeSonosId3(sequence) {
+    const timestamp90k =
+        sequence * HLS_SEGMENT_TIME * 90000;
+
+    const frames = Buffer.concat([
+        makeTimestampPrivFrame(timestamp90k),
+        makeWxxxFrame()
+    ]);
+
+    const header = Buffer.concat([
+        Buffer.from('ID3', 'ascii'),
+        Buffer.from([0x03, 0x00, 0x00]),
+        id3SyncSafe(frames.length)
+    ]);
+
+    return Buffer.concat([
+        header,
+        frames
+    ]);
+}
+
+function startKbsClassicHls() {
+
+    // 이미 실행 중이면 다시 시작하지 않음
+    if (hlsProcess) {
+        return;
+    }
+
+    // 이전 HLS 파일 정리
+    try {
+        const files = fs.readdirSync(HLS_DIR);
+
+        for (const file of files) {
+            fs.unlinkSync(path.join(HLS_DIR, file));
+        }
+    } catch (e) {
+        console.log('HLS cleanup error:', e);
+    }
+
+    // KBS Classic 원본 스트림 주소 가져오기
+    getkbs('kbs_classic').then(function(urls) {
+
+        if (urls == 'invaild' || !urls.includes('m3u8')) {
+
+            console.log(
+                'KBS Classic HLS URL acquisition failed'
+            );
+
+            return;
+        }
+
+        console.log(
+            'KBS Classic HLS source:',
+            urls
+        );
+
+        const segmentPattern =
+            path.join(
+                HLS_DIR,
+                'segment_%05d.aac'
+            );
+
+        // FFmpeg로 KBS Classic을 AAC로 변환하면서
+        // 6초 단위의 HLS용 세그먼트를 생성
+        hlsProcess = child_process.spawn("ffmpeg", [
+
+            "-loglevel", "error",
+
+            "-i", urls,
+
+            "-vn",
+
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ar", "44100",
+            "-ac", "2",
+
+            "-f", "segment",
+            "-segment_time", String(HLS_SEGMENT_TIME),
+            "-segment_format", "adts",
+            "-reset_timestamps", "1",
+
+            segmentPattern
+
+        ], {
+            detached: false
+        });
+
+        hlsStarted = true;
+
+        console.log(
+            "KBS Classic HLS ffmpeg started:",
+            hlsProcess.pid
+        );
+
+        // FFmpeg 오류 출력
+        hlsProcess.stderr.on("data", function(data) {
+
+            console.log(
+                "HLS ffmpeg:",
+                data.toString().trim()
+            );
+
+        });
+
+        // FFmpeg 종료 처리
+        hlsProcess.on("exit", function(code) {
+
+            console.log(
+                "KBS Classic HLS ffmpeg exited:",
+                code
+            );
+
+            hlsProcess = null;
+            hlsStarted = false;
+
+        });
+
+        // FFmpeg 실행 오류
+        hlsProcess.on("error", function(e) {
+
+            console.log(
+                "KBS Classic HLS ffmpeg error:",
+                e
+            );
+
+            hlsProcess = null;
+            hlsStarted = false;
+
+        });
+
+    });
+}
+
 function return_pipe(urls, resp, req) {
     var xffmpeg = child_process.spawn("ffmpeg", [
          "-loglevel", "error", "-i", urls, "-metadata", "title=Korea Radio for HA", "-acodec", "libmp3lame", "-ar", "44100", "-f", "mp3", "pipe:1" // output to stdout
@@ -50,9 +273,102 @@ var liveServer = http.createServer((req, resp) => {
     const urlParams = urlParts.query;
 	console.log(urlParams);
 	const urlPath = urlParts.pathname;
-	
-	if(urlPath == "/radio"){
-		
+
+    // ========================================================
+    // KBS Classic HLS 테스트
+    // ========================================================
+    if(urlPath == "/radio_hls" || urlPath.startsWith("/radio_hls/")){
+
+        const token_key = urlParams['token'];
+        const key = urlParams['keys'];
+
+        // 토큰 확인
+        if(token_key != mytoken){
+            resp.writeHead(403, {
+                'Content-Type': 'text/plain'
+            });
+
+            resp.end('Forbidden');
+            return;
+        }
+
+        // 현재는 KBS Classic만 허용
+        if(key != 'kbs_classic'){
+            resp.writeHead(404, {
+                'Content-Type': 'text/plain'
+            });
+
+            resp.end('Not Found');
+            return;
+        }
+
+        // HLS FFmpeg 시작
+        startKbsClassicHls();
+
+        // --------------------------------------------
+        // AAC 세그먼트 요청
+        // --------------------------------------------
+        const segmentMatch =
+            urlPath.match(/^\/radio_hls\/(segment_\d+\.aac)$/);
+
+        if(segmentMatch){
+
+            const filename = segmentMatch[1];
+            const filepath = path.join(HLS_DIR, filename);
+
+            if(fs.existsSync(filepath)){
+
+                resp.writeHead(200, {
+                    'Content-Type': 'audio/aac',
+                    'Cache-Control': 'no-cache'
+                });
+
+                const stream =
+                    fs.createReadStream(filepath);
+
+                stream.pipe(resp);
+
+                stream.on('error', function(err){
+
+                    console.log(
+                        'HLS segment read error:',
+                        err
+                    );
+
+                    if(!resp.headersSent){
+                        resp.writeHead(500);
+                    }
+
+                    resp.end();
+                });
+
+            } else {
+
+                resp.writeHead(404, {
+                    'Content-Type': 'text/plain'
+                });
+
+                resp.end('Segment not found');
+            }
+
+            return;
+        }
+
+        // --------------------------------------------
+        // 아직 playlist는 다음 단계에서 추가
+        // --------------------------------------------
+        resp.writeHead(200, {
+            'Content-Type': 'text/plain'
+        });
+
+        resp.end('KBS Classic HLS server is running');
+
+        return;
+    }
+
+
+    if(urlPath == "/radio"){	
+
 	    const token_key = urlParams['token'];
 	    if(token_key == mytoken){
 		    const key = urlParams['keys'];
