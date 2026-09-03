@@ -121,6 +121,45 @@ function makeSonosId3(sequence) {
     ]);
 }
 
+
+// ============================================================
+// AAC 세그먼트 앞에 Sonos용 ID3 태그 삽입
+// ============================================================
+function addSonosId3ToSegment(filepath, sequence) {
+
+    try {
+
+        if(!fs.existsSync(filepath)){
+            return;
+        }
+
+        const audio = fs.readFileSync(filepath);
+
+        const id3 = makeSonosId3(sequence);
+
+        fs.writeFileSync(
+            filepath,
+            Buffer.concat([
+                id3,
+                audio
+            ])
+        );
+
+        console.log(
+            'Sonos ID3 artwork added:',
+            path.basename(filepath)
+        );
+
+    } catch(e) {
+
+        console.log(
+            'Sonos ID3 error:',
+            e
+        );
+
+    }
+}
+
 function startKbsClassicHls() {
 
     // 이미 실행 중이면 다시 시작하지 않음
@@ -162,6 +201,63 @@ function startKbsClassicHls() {
                 'segment_%05d.aac'
             );
 
+// ============================================================
+// 생성된 AAC 세그먼트 감시
+// ============================================================
+
+let hlsWatcher = null;
+const hlsTaggedSegments = new Set();
+
+hlsWatcher = fs.watch(
+    HLS_DIR,
+    function(eventType, filename) {
+
+        if(!filename){
+            return;
+        }
+
+        const match =
+            filename.match(/^segment_(\d+)\.aac$/);
+
+        if(!match){
+            return;
+        }
+
+        const sequence =
+            parseInt(match[1], 10);
+
+        // 이미 ID3를 넣은 세그먼트는 다시 처리하지 않음
+        if(hlsTaggedSegments.has(sequence)){
+            return;
+        }
+
+        const filepath =
+            path.join(HLS_DIR, filename);
+
+        // FFmpeg가 파일 작성을 끝낼 시간을 줌
+        setTimeout(function() {
+
+            if(!fs.existsSync(filepath)){
+                return;
+            }
+
+            // 다시 한번 중복 처리 여부 확인
+            if(hlsTaggedSegments.has(sequence)){
+                return;
+            }
+
+            addSonosId3ToSegment(
+                filepath,
+                sequence
+            );
+
+            hlsTaggedSegments.add(sequence);
+
+        }, 500);
+
+    }
+);
+		
         // FFmpeg로 KBS Classic을 AAC로 변환하면서
         // 6초 단위의 HLS용 세그먼트를 생성
         hlsProcess = child_process.spawn("ffmpeg", [
@@ -309,7 +405,7 @@ var liveServer = http.createServer((req, resp) => {
         // AAC 세그먼트 요청
         // --------------------------------------------
         const segmentMatch =
-            urlPath.match(/^\/radio_hls\/(segment_\d+\.aac)$/);
+            urlPath.match(/^\/radio_hls\/segment\/(segment_\d+\.aac)$/);
 
         if(segmentMatch){
 
@@ -355,15 +451,70 @@ var liveServer = http.createServer((req, resp) => {
         }
 
         // --------------------------------------------
-        // 아직 playlist는 다음 단계에서 추가
+        // HLS playlist 생성
         // --------------------------------------------
+        const playlistFiles = fs.readdirSync(HLS_DIR)
+            .filter(function(file) {
+                return /^segment_\d+\.aac$/.test(file);
+            })
+            .sort();
+
+        if(playlistFiles.length == 0){
+
+            resp.writeHead(503, {
+                'Content-Type': 'text/plain',
+                'Cache-Control': 'no-cache'
+            });
+
+            resp.end('HLS stream is starting');
+            return;
+        }
+
+        // 최근 세그먼트만 사용
+        const recentFiles =
+            playlistFiles.slice(-HLS_PLAYLIST_SIZE);
+
+        const firstSequence =
+            parseInt(
+                recentFiles[0]
+                    .match(/segment_(\d+)\.aac/)[1]
+            );
+
+        let playlist =
+            '#EXTM3U\n' +
+            '#EXT-X-VERSION:3\n' +
+            '#EXT-X-TARGETDURATION:' +
+            HLS_SEGMENT_TIME +
+            '\n' +
+            '#EXT-X-MEDIA-SEQUENCE:' +
+            firstSequence +
+            '\n';
+
+        for(const file of recentFiles){
+
+            playlist +=
+                '#EXTINF:' +
+                HLS_SEGMENT_TIME +
+                '.000,\n';
+
+            playlist +=
+                'segment/' +
+                file +
+                '?token=' +
+                encodeURIComponent(mytoken) +
+                '&keys=kbs_classic\n';
+        }
+
         resp.writeHead(200, {
-            'Content-Type': 'text/plain'
+            'Content-Type': 'application/vnd.apple.mpegurl',
+            'Cache-Control': 'no-cache, no-store'
         });
 
-        resp.end('KBS Classic HLS server is running');
+        resp.end(playlist);
 
         return;
+		
+		
     }
 
 
