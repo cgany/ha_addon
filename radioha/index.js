@@ -35,6 +35,8 @@ let hlsProcess = null;
 let hlsSequence = 0;
 let hlsStarted = false;
 
+let hlsSegmentWatcher = null;
+const hlsTaggedSegments = new Set();
 
 // ID3v2 sync-safe integer
 function id3SyncSafe(size) {
@@ -195,68 +197,129 @@ function startKbsClassicHls() {
             urls
         );
 
-        const segmentPattern =
-            path.join(
-                HLS_DIR,
-                'segment_%05d.aac'
-            );
+const HLS_SOURCE_DIR =
+    path.join(os.tmpdir(), 'radioha_hls_source');
+
+if (!fs.existsSync(HLS_SOURCE_DIR)) {
+    fs.mkdirSync(HLS_SOURCE_DIR, { recursive: true });
+}
+
+const segmentPattern =
+    path.join(
+        HLS_SOURCE_DIR,
+        'segment_%05d.aac'
+    );
 
 // ============================================================
-// 생성된 AAC 세그먼트 감시
+// 완성된 AAC 세그먼트 감시 및 Sonos ID3 추가
 // ============================================================
 
-let hlsWatcher = null;
-const hlsTaggedSegments = new Set();
+if (!hlsSegmentWatcher) {
 
-hlsWatcher = fs.watch(
-    HLS_DIR,
-    function(eventType, filename) {
+    hlsSegmentWatcher = setInterval(function() {
 
-        if(!filename){
+        let files;
+
+        try {
+            files = fs.readdirSync(HLS_SOURCE_DIR);
+        } catch(e) {
             return;
         }
 
-        const match =
-            filename.match(/^segment_(\d+)\.aac$/);
+        files
+            .filter(function(file) {
+                return /^segment_\d+\.aac$/.test(file);
+            })
+            .forEach(function(file) {
 
-        if(!match){
-            return;
-        }
+                const match =
+                    file.match(/^segment_(\d+)\.aac$/);
 
-        const sequence =
-            parseInt(match[1], 10);
+                if(!match) {
+                    return;
+                }
 
-        // 이미 ID3를 넣은 세그먼트는 다시 처리하지 않음
-        if(hlsTaggedSegments.has(sequence)){
-            return;
-        }
+                const sequence =
+                    parseInt(match[1], 10);
 
-        const filepath =
-            path.join(HLS_DIR, filename);
+                if(hlsTaggedSegments.has(sequence)) {
+                    return;
+                }
 
-        // FFmpeg가 파일 작성을 끝낼 시간을 줌
-        setTimeout(function() {
+                const sourcePath =
+                    path.join(HLS_SOURCE_DIR, file);
 
-            if(!fs.existsSync(filepath)){
-                return;
-            }
+                const targetPath =
+                    path.join(HLS_DIR, file);
 
-            // 다시 한번 중복 처리 여부 확인
-            if(hlsTaggedSegments.has(sequence)){
-                return;
-            }
+                if(!fs.existsSync(sourcePath)) {
+                    return;
+                }
 
-            addSonosId3ToSegment(
-                filepath,
-                sequence
-            );
+                let size1;
 
-            hlsTaggedSegments.add(sequence);
+                try {
+                    size1 = fs.statSync(sourcePath).size;
+                } catch(e) {
+                    return;
+                }
 
-        }, 500);
+                setTimeout(function() {
 
-    }
-);
+                    if(!fs.existsSync(sourcePath)) {
+                        return;
+                    }
+
+                    let size2;
+
+                    try {
+                        size2 = fs.statSync(sourcePath).size;
+                    } catch(e) {
+                        return;
+                    }
+
+                    if(size1 !== size2) {
+                        return;
+                    }
+
+                    try {
+
+                        const audio =
+                            fs.readFileSync(sourcePath);
+
+                        const id3 =
+                            makeSonosId3(sequence);
+
+                        fs.writeFileSync(
+                            targetPath,
+                            Buffer.concat([
+                                id3,
+                                audio
+                            ])
+                        );
+
+                        hlsTaggedSegments.add(sequence);
+
+                        console.log(
+                            'Sonos ID3 artwork added:',
+                            file
+                        );
+
+                    } catch(e) {
+
+                        console.log(
+                            'Sonos ID3 segment error:',
+                            e
+                        );
+
+                    }
+
+                }, 1000);
+
+            });
+
+    }, 1000);
+}
 		
         // FFmpeg로 KBS Classic을 AAC로 변환하면서
         // 6초 단위의 HLS용 세그먼트를 생성
