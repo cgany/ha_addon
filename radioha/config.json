@@ -1,7 +1,7 @@
 {
-  "name": "Korea Radio for HA",
+  "name": "Korea Radio for HA TEST",
   "version": "1.0.2",
-  "slug": "radioha",
+  "slug": "radioha_test",
   "description": "Korea Intenet Radio for HA",
   "host_network":true,
   "arch": [
