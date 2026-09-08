@@ -5,6 +5,7 @@ const url = require("url");
 const child_process = require("child_process");
 const fs = require('fs');
 const axios = require('axios');
+const { Transform } = require('stream');
 const data = JSON.parse(fs.readFileSync('/app/radio-list.json', 'utf8')); // 라디오 주소 저장 파일 열기
 
 const instance = axios.create({
@@ -393,6 +394,201 @@ if (!hlsSegmentWatcher) {
     });
 }
 
+
+// ============================================================
+// ICY MP3 Radio wrapper
+// 기존 /radio 스트림에 ICY StreamTitle 삽입
+// ============================================================
+
+const ICY_METAINT = 16000;
+
+function makeIcyMetadata(title) {
+
+    const metadata =
+        Buffer.from(
+            "StreamTitle='" + title + "';",
+            'utf8'
+        );
+
+    const paddedLength =
+        Math.ceil(metadata.length / 16) * 16;
+
+    const block =
+        Buffer.alloc(1 + paddedLength);
+
+    block[0] =
+        paddedLength / 16;
+
+    metadata.copy(
+        block,
+        1
+    );
+
+    return block;
+}
+
+
+class IcyMetadataTransform extends Transform {
+
+    constructor(title) {
+
+        super();
+
+        this.title = title;
+        this.audioBytes = 0;
+
+    }
+
+    _transform(chunk, encoding, callback) {
+
+        let offset = 0;
+
+        while(offset < chunk.length) {
+
+            const remaining =
+                ICY_METAINT - this.audioBytes;
+
+            const length =
+                Math.min(
+                    remaining,
+                    chunk.length - offset
+                );
+
+            this.push(
+                chunk.subarray(
+                    offset,
+                    offset + length
+                )
+            );
+
+            offset += length;
+            this.audioBytes += length;
+
+            if(this.audioBytes >= ICY_METAINT) {
+
+                this.push(
+                    makeIcyMetadata(
+                        this.title
+                    )
+                );
+
+                this.audioBytes = 0;
+            }
+        }
+
+        callback();
+    }
+}
+
+
+function startIcyRadio(key, resp, req) {
+
+    const upstreamUrl =
+        'http://127.0.0.1:' +
+        port +
+        '/radio?keys=' +
+        encodeURIComponent(key) +
+        '&token=' +
+        encodeURIComponent(mytoken);
+
+    console.log(
+        'ICY upstream:',
+        upstreamUrl
+    );
+
+    const upstream =
+        http.get(
+            upstreamUrl,
+            {
+                headers: {
+                    'icy-metadata': '1'
+                }
+            },
+            function(upstreamResp) {
+
+                if(upstreamResp.statusCode != 200) {
+
+                    console.log(
+                        'ICY upstream status:',
+                        upstreamResp.statusCode
+                    );
+
+                    resp.statusCode =
+                        upstreamResp.statusCode;
+
+                    resp.end();
+
+                    return;
+                }
+
+                resp.writeHead(
+                    200,
+                    {
+                        'Content-Type':
+                            'audio/mpeg',
+
+                        'Cache-Control':
+                            'no-cache',
+
+                        'icy-metaint':
+                            String(ICY_METAINT),
+
+                        'icy-name':
+                            'KBS Classic',
+
+                        'icy-genre':
+                            'Classical',
+
+                        'icy-br':
+                            '128'
+                    }
+                );
+
+                const icyStream =
+                    new IcyMetadataTransform(
+                        'KBS Classic'
+                    );
+
+                upstreamResp.pipe(
+                    icyStream
+                ).pipe(
+                    resp
+                );
+
+                req.on(
+                    'close',
+                    function() {
+
+                        upstream.destroy();
+                        icyStream.destroy();
+
+                    }
+                );
+
+            }
+        );
+
+    upstream.on(
+        'error',
+        function(e) {
+
+            console.log(
+                'ICY upstream error:',
+                e
+            );
+
+            if(!resp.headersSent) {
+                resp.statusCode = 500;
+            }
+
+            resp.end();
+
+        }
+    );
+}
+
+
+
 function return_pipe(urls, resp, req) {
     var xffmpeg = child_process.spawn("ffmpeg", [
          "-loglevel", "error", "-i", urls, "-metadata", "title=Korea Radio for HA", "-acodec", "libmp3lame", "-ar", "44100", "-f", "mp3", "pipe:1" // output to stdout
@@ -579,7 +775,45 @@ var liveServer = http.createServer((req, resp) => {
 		
 		
     }
+    // ========================================================
+    // KBS Classic ICY MP3 테스트
+    // ========================================================
 
+    if(urlPath == "/radio_icy") {
+
+        const token_key = urlParams['token'];
+        const key = urlParams['keys'];
+
+        if(token_key != mytoken) {
+
+            resp.writeHead(403, {
+                'Content-Type': 'text/plain'
+            });
+
+            resp.end('Forbidden');
+
+            return;
+        }
+
+        if(key != 'kbs_classic') {
+
+            resp.writeHead(404, {
+                'Content-Type': 'text/plain'
+            });
+
+            resp.end('Not Found');
+
+            return;
+        }
+
+        startIcyRadio(
+            key,
+            resp,
+            req
+        );
+
+        return;
+    }
 
     if(urlPath == "/radio"){	
 
